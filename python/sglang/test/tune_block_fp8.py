@@ -7,10 +7,9 @@ import torch
 import triton
 import matplotlib.pyplot as plt
 
-from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8, native_per_token_group_quant_fp8, w8a8_block_fp8_matmul, native_w8a8_block_fp8_matmul
+from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8, w8a8_block_fp8_matmul
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-from sglang.srt.layers.quantization.fp8_kernel_old import w8a8_block_fp8_matmul as w8a8_block_fp8_matmul_old
 
 
 # for i in [1, 8, 32, 128, 512, 2048, 4096] 
@@ -95,10 +94,6 @@ def benchmark(M, N, K, provider):
     Bs = torch.rand(n_tiles, k_tiles, dtype=torch.float32, device='cuda') * factor_for_scale
 
     quantiles = [0.5, 0.2, 0.8]
-    if provider == "native":
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: native_w8a8_block_fp8_matmul(A_fp8, B_fp8, As, Bs, block_size, out_dtype), quantiles=quantiles)
-    if provider == "triton-old":
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: w8a8_block_fp8_matmul_old(A_fp8, B_fp8, As, Bs, block_size, out_dtype), quantiles=quantiles)
     if provider == 'triton':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: w8a8_block_fp8_matmul(A_fp8, B_fp8, As, Bs, block_size, out_dtype), quantiles=quantiles)
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
