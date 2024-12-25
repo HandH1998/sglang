@@ -981,10 +981,10 @@ def get_cuda_autotune_config():
                       num_warps=4),
     ]
 
-@triton.autotune(
-    configs=get_cuda_autotune_config(),
-    key=['M', 'N', 'K'],
-)
+# @triton.autotune(
+#     configs=get_cuda_autotune_config(),
+#     key=['M', 'N', 'K'],
+# )
 @triton.jit
 def _w8a8_block_fp8_matmul(
     # Pointers to inputs and output
@@ -1115,13 +1115,13 @@ def w8a8_block_fp8_matmul(
     # BLOCK_SIZE_M, BLOCK_SIZE_K, BLOCK_SIZE_N can be optimized.
     # BLOCK_SIZE_K must be divisable by block_k
     # BLOCK_SIZE_N and BLOCK_SIZE_M has no requirements
-    # BLOCK_SIZE_M = 128
-    # if M < BLOCK_SIZE_M:
-    #     BLOCK_SIZE_M = triton.next_power_of_2(M)
-    #     BLOCK_SIZE_M = max(BLOCK_SIZE_M, 16)
-    # BLOCK_SIZE_K = block_k
-    # assert block_k % BLOCK_SIZE_K == 0
-    # BLOCK_SIZE_N = block_n
+    BLOCK_SIZE_M = 128
+    if M < BLOCK_SIZE_M:
+        BLOCK_SIZE_M = triton.next_power_of_2(M)
+        BLOCK_SIZE_M = max(BLOCK_SIZE_M, 16)
+    BLOCK_SIZE_K = block_k
+    assert block_k % BLOCK_SIZE_K == 0
+    BLOCK_SIZE_N = block_n
 
     def grid(META):
         return (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
@@ -1145,12 +1145,11 @@ def w8a8_block_fp8_matmul(
                     As.stride(-2),
                     As.stride(-1),
                     Bs.stride(1),
-                    Bs.stride(0),)
-    #                 BLOCK_SIZE_M=BLOCK_SIZE_M,
-    # # )
-    #                 BLOCK_SIZE_N=BLOCK_SIZE_N,
-    #                 BLOCK_SIZE_K=BLOCK_SIZE_K,
-                    # GROUP_SIZE_M=8,)
+                    Bs.stride(0),
+                    BLOCK_SIZE_M=BLOCK_SIZE_M,
+                    BLOCK_SIZE_N=BLOCK_SIZE_N,
+                    BLOCK_SIZE_K=BLOCK_SIZE_K,
+                    GROUP_SIZE_M=8,)
 
     return C
 
