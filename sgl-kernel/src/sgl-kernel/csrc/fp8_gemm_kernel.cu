@@ -483,33 +483,6 @@ void launch_sm90_fp8_scaled_mm(torch::Tensor& out, const torch::Tensor& a, const
 
     auto status = gemm_op.run(args, workspace.data_ptr(), stream);
     
-    if (status != cutlass::Status::kSuccess) {
-        std::stringstream error_msg;
-        error_msg << "GEMM execution failed. Status: " 
-                  << cutlass::cutlassGetStatusString(status) << "\n"
-                  << "Problem size: M=" << a.size(0) << ", N=" << b.size(1) << ", K=" << a.size(1) << "\n"
-                  << "Device: " << a.device() << "\n"
-                  << "Data types - A: " << a.dtype() 
-                  << ", B: " << b.dtype() 
-                  << ", Out: " << out.dtype() << "\n"
-                  << "Memory alignment - A: " << reinterpret_cast<std::uintptr_t>(a.data_ptr()) % 16 
-                  << ", B: " << reinterpret_cast<std::uintptr_t>(b.data_ptr()) % 16 
-                  << ", Out: " << reinterpret_cast<std::uintptr_t>(out.data_ptr()) % 16
-                  << ", workspace_size: " << workspace_size
-                  << ", workspace_options: " << workspace_options;
-        
-        cudaError_t cuda_err = cudaGetLastError();
-        if (cuda_err != cudaSuccess) {
-            error_msg << "\nCUDA error: " << cudaGetErrorString(cuda_err);
-        }
-        
-        TORCH_CHECK(false, error_msg.str());
-    }
-
-    cudaError_t sync_err = cudaStreamSynchronize(stream);
-    if (sync_err != cudaSuccess) {
-        TORCH_CHECK(false, "CUDA sync error: ", cudaGetErrorString(sync_err));
-    }
     TORCH_CHECK(status == cutlass::Status::kSuccess)
 }
 

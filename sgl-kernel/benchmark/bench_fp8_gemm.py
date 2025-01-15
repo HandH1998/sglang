@@ -8,6 +8,8 @@ from sgl_kernel import fp8_scaled_mm as sgl_scaled_mm
 from sgl_kernel import fp8_scaled_mm_profile as sgl_scaled_mm_profile
 import time
 import vllm
+import triton
+
 def get_sm_version():
     device = torch.cuda.current_device()
     major, minor = torch.cuda.get_device_capability(device)
@@ -40,11 +42,11 @@ def do_profile(dtype="bf16", n=4096, k=8192):
         x_log=False,
         line_arg="provider",
         line_vals=["vllm-fp8-fp16", "vllm-fp8-bf16", "sglang-fp8-fp16", "sglang-fp8-bf16", 
-                  "sglang-fp8-profile-fp16", "sglang-fp8-profile-bf16"],
+                  "sglang-fp8-profile-fp16", "sglang-fp8-profile-bf16", "torch-fp8"],
         line_names=["vllm-fp8-fp16", "vllm-fp8-bf16", "sglang-fp8-fp16", "sglang-fp8-bf16", 
-                   "sglang-fp8-profile-fp16", "sglang-fp8-profile-bf16"],
+                   "sglang-fp8-profile-fp16", "sglang-fp8-profile-bf16", "torch-fp8"],
         styles=[("green", "-"), ("green", "--"), ("blue", "-"), ("blue", "--"), 
-               ("red", "-"), ("red", "--")],
+               ("red", "-"), ("red", "--"), ("purple", "-")],
         ylabel="GB/s",
         plot_name="int8 scaled matmul",
         args={},
@@ -86,7 +88,28 @@ def benchmark(batch_size, provider):
             lambda: sgl_scaled_mm(a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype, bias=None, is_profile=False),
             quantiles=quantiles,
         )
-
+    elif provider == "torch-fp8":
+        scale_a_2d = scale_a_fp8.float().unsqueeze(1)  # [M, 1]
+        scale_b_2d = scale_b_fp8.float().unsqueeze(0)  # [1, N]
+        try:
+            out = torch.empty(
+                (a_fp8.shape[0], b_fp8.shape[0]), device="cuda", dtype=torch.bfloat16
+            )
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: torch._scaled_mm(
+                    a_fp8,
+                    b_fp8,
+                    out=out,
+                    out_dtype=torch.bfloat16,
+                    scale_a=scale_a_2d,
+                    scale_b=scale_b_2d,
+                    use_fast_accum=True,
+                ),
+                quantiles=quantiles,
+            )
+        except RuntimeError as e:
+            print("Error details:", e)
+            raise
     gbps = lambda ms: (2 * M * N * K + M * N) * a.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 

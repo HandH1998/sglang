@@ -38,27 +38,28 @@ include_dirs = [
     nlohmann.resolve(),
 ]
 
-# nvcc_flags = [
-#     "-O3",
-#     "-Xcompiler",
-#     "-fPIC",
-#     "-gencode=arch=compute_75,code=sm_75",
-#     "-gencode=arch=compute_80,code=sm_80",
-#     "-gencode=arch=compute_89,code=sm_89",
-#     "-gencode=arch=compute_90,code=sm_90",
-#     "-U__CUDA_NO_HALF_OPERATORS__",
-#     "-U__CUDA_NO_HALF2_OPERATORS__",
-# ]
 nvcc_flags = [
     "-O3",
     "-Xcompiler",
     "-fPIC",
-    # "-gencode=arch=compute_89,code=sm_89",
-    # "-gencode=arch=compute_90,code=sm_90",
-    "-gencode=arch=compute_90a,code=sm_90a",  # 只保留这个
+    "-gencode=arch=compute_75,code=sm_75",
+    "-gencode=arch=compute_80,code=sm_80",
+    "-gencode=arch=compute_89,code=sm_89",
+    "-gencode=arch=compute_90,code=sm_90",
+    "-gencode=arch=compute_90a,code=sm_90a",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF2_OPERATORS__",
 ]
+# nvcc_flags = [
+#     "-O3",
+#     "-Xcompiler",
+#     "-fPIC",
+#     # "-gencode=arch=compute_89,code=sm_89",
+#     # "-gencode=arch=compute_90,code=sm_90",
+#     "-gencode=arch=compute_90a,code=sm_90a",  # 只保留这个
+#     "-U__CUDA_NO_HALF_OPERATORS__",
+#     "-U__CUDA_NO_HALF2_OPERATORS__",
+# ]
 
 # 如果是调试模式，添加调试标志
 if debug_build:
