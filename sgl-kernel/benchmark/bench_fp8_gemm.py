@@ -7,7 +7,7 @@ from vllm._custom_ops import scaled_fp8_quant as vllm_scaled_fp8_quant
 from sgl_kernel import fp8_scaled_mm as sgl_scaled_mm
 from sgl_kernel import fp8_scaled_mm_profile as sgl_scaled_mm_profile
 import time
-
+import vllm
 def get_sm_version():
     device = torch.cuda.current_device()
     major, minor = torch.cuda.get_device_capability(device)
@@ -21,11 +21,9 @@ def get_config_filename(dtype="bf16"):
     sm_version = get_sm_version()
     return f"sm{sm_version}_fp8_{dtype}.json"
 
-def do_profile(dtype="bf16"):
+def do_profile(dtype="bf16", n=4096, k=8192):
     M = [1, 16, 64, 128, 256, 512, 1024, 2048, 4096]
     for m in M:
-        n = 4096
-        k = 8192
         a = torch.ones((m, k), device="cuda") * 5.0
         b = torch.ones((n, k), device="cuda") * 5.0
         scale_a = torch.randn((m,), device="cuda", dtype=torch.float32)
@@ -74,7 +72,7 @@ def benchmark(batch_size, provider):
             quantiles=quantiles,
         )
     elif "sglang-fp8-profile" in provider:
-        do_profile(dtype)
+        do_profile(dtype, N, K)
         try:
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: sgl_scaled_mm(a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype, bias=None, is_profile=True),

@@ -380,8 +380,8 @@ struct DeviceGemmFp8RowwiseSm90
 
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<cutlass::arch::Sm90,
         cutlass::arch::OpClassTensorOp, TileShape, ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto,
-        ElementAccumulator, ElementComputeEpilogue, ElementC, LayoutC, AlignmentC, ElementOutput, LayoutOutput,
-        AlignmentOutput, cutlass::epilogue::TmaWarpSpecialized, EpilogueEVT>::CollectiveOp;
+        ElementAccumulator, ElementComputeEpilogue, ElementC, LayoutC, 4, ElementOutput, LayoutOutput,
+        4, cutlass::epilogue::TmaWarpSpecialized, EpilogueEVT>::CollectiveOp;
 
     using DefaultSchedule = cutlass::gemm::KernelTmaWarpSpecialized;
     using PongSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
@@ -393,10 +393,10 @@ struct DeviceGemmFp8RowwiseSm90
     using MainLoopSchedule = cute::conditional_t<FAST_ACCUM, FastAccum, SlowAccum>;
 
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<ArchTag, OperatorClass, ElementA,
-        LayoutA, AlignmentA, ElementB, LayoutB, AlignmentB, ElementAccumulator, TileShape, ClusterShape,
+        LayoutA, 16, ElementB, LayoutB, 16, ElementAccumulator, TileShape, ClusterShape,
         cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
             sizeof(typename CollectiveEpilogue::SharedStorage))>,
-        MainLoopSchedule>::CollectiveOp;
+        FastPongSchedule>::CollectiveOp;
 
     using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, // Indicates ProblemShape
         CollectiveMainloop, CollectiveEpilogue, TileScheduler>;
@@ -436,15 +436,6 @@ typename Gemm::Arguments prepare_sm90_fp8_args(torch::Tensor& out, const torch::
     StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, 1));
     StrideC stride_c;
     StrideD stride_d = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, 1));
-    std::cout << "m: " << m << std::endl;
-    std::cout << "n: " << n << std::endl;
-    std::cout << "k: " << k << std::endl;
-    std::cout << "stride_a: " << stride_a << std::endl;
-    std::cout << "stride_b: " << stride_b << std::endl;
-    std::cout << "stride_d: " << stride_d << std::endl;
-    std::cout << "ptr_a: " << ptr_a << std::endl;
-    std::cout << "ptr_b: " << ptr_b << std::endl;
-    std::cout << "ptr_d: " << ptr_d << std::endl;
     typename Gemm::Arguments args
         = {cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k, 1}, {ptr_a, stride_a, ptr_b, stride_b},
             {{}, // epilogue.thread
@@ -507,7 +498,6 @@ void launch_sm90_fp8_scaled_mm(torch::Tensor& out, const torch::Tensor& a, const
                   << ", workspace_size: " << workspace_size
                   << ", workspace_options: " << workspace_options;
         
-        // 检查CUDA错误
         cudaError_t cuda_err = cudaGetLastError();
         if (cuda_err != cudaSuccess) {
             error_msg << "\nCUDA error: " << cudaGetErrorString(cuda_err);
@@ -516,7 +506,6 @@ void launch_sm90_fp8_scaled_mm(torch::Tensor& out, const torch::Tensor& a, const
         TORCH_CHECK(false, error_msg.str());
     }
 
-    // 5. 同步并检查最终状态
     cudaError_t sync_err = cudaStreamSynchronize(stream);
     if (sync_err != cudaSuccess) {
         TORCH_CHECK(false, "CUDA sync error: ", cudaGetErrorString(sync_err));
@@ -534,7 +523,7 @@ void sm90_dispatch_bias(torch::Tensor& out, const torch::Tensor& a, const torch:
     using AccumElementType = float;
     using MainloopScheduleType = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
     using EpilogueScheduleType = cutlass::epilogue::TmaWarpSpecialized;
-    using TileSchedulerType = void;
+    using TileSchedulerType = cutlass::gemm::PersistentScheduler;
     if (bias) {
         using Gemm = typename DeviceGemmFp8RowwiseSm90<ElementInput, ElementOutput, AccumElementType, CTAShape,
             ClusterShape, MainloopScheduleType, EpilogueScheduleType, TileSchedulerType, true>::Gemm;
@@ -565,6 +554,70 @@ void sm90_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch
         return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_2, _1, _1>>(out, a, b, scales_a, scales_b, bias);
     }
 }
+
+// define macro for dispatch
+#define DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, CLUSTER_M, CLUSTER_N, CLUSTER_K) \
+    sm90_dispatch_bias<ElementOutput, Shape<CTA_M, CTA_N, CTA_K>, \
+        Shape<CLUSTER_M, CLUSTER_N, CLUSTER_K>>(out, mat_a, mat_b, scales_a, scales_b, bias)
+
+// generate all stages for a group of configs
+#define DISPATCH_FP8_GEMM_SM90_GROUP(GROUP_ID, CTA_M, CTA_N, CTA_K, BASE_CASE) \
+    case BASE_CASE:     DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _1, _1, _1); break; \
+    case BASE_CASE + 1: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _2, _1, _1); break; \
+    case BASE_CASE + 2: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _1, _2, _1); break; \
+    case BASE_CASE + 3: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _2, _2, _1); break; \
+    case BASE_CASE + 4: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _1, _4, _1); break; \
+    case BASE_CASE + 5: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _4, _1, _1); break; \
+    case BASE_CASE + 6: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _2, _4, _1); break; \
+    case BASE_CASE + 7: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _4, _2, _1); break;
+
+template <typename ElementOutput>
+void sm90_dispatch_shape_explicit(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
+                            const torch::Tensor& scales_a, const torch::Tensor& scales_b,
+                            const c10::optional<torch::Tensor>& bias,
+                            int config_id) {
+#ifdef SGL_DEBUG_BUILD
+    switch(config_id) {
+        case 1:
+            DISPATCH_FP8_GEMM_SM90_CONFIG(_64, _64, _128, _1, _8, _1);
+            break;
+        case 2:
+            DISPATCH_FP8_GEMM_SM90_CONFIG(_64, _128, _128, _2, _1, _1);
+            break;
+        case 3:
+            DISPATCH_FP8_GEMM_SM90_CONFIG(_128, _128, _128, _2, _1, _1);
+            break;
+        default:
+            throw std::runtime_error("Invalid config_id in debug mode: " + std::to_string(config_id));
+    }
+#else
+    switch(config_id) {
+        // Group 1: Small tiles
+        DISPATCH_FP8_GEMM_SM90_GROUP(1, _64, _64, _64, 1);
+        DISPATCH_FP8_GEMM_SM90_GROUP(2, _64, _64, _128, 9);
+        DISPATCH_FP8_GEMM_SM90_GROUP(3, _64, _128, _64, 17);
+        
+        // Group 2: Medium tiles
+        DISPATCH_FP8_GEMM_SM90_GROUP(4, _128, _64, _64, 25);
+        DISPATCH_FP8_GEMM_SM90_GROUP(5, _128, _128, _64, 33);
+        DISPATCH_FP8_GEMM_SM90_GROUP(6, _128, _128, _128, 41);
+        
+        // Group 3: Large tiles
+        DISPATCH_FP8_GEMM_SM90_GROUP(7, _128, _256, _64, 49);
+        DISPATCH_FP8_GEMM_SM90_GROUP(8, _256, _128, _64, 57);
+        DISPATCH_FP8_GEMM_SM90_GROUP(9, _256, _256, _64, 65);
+        
+        // Group 4: Extra large tiles
+        DISPATCH_FP8_GEMM_SM90_GROUP(10, _256, _128, _128, 73);
+        DISPATCH_FP8_GEMM_SM90_GROUP(11, _128, _256, _128, 81);
+        DISPATCH_FP8_GEMM_SM90_GROUP(12, _256, _256, _128, 89);
+
+        default:
+            throw std::runtime_error("Invalid config_id: " + std::to_string(config_id));
+    }
+#endif
+}
+
 
 #define DISPATCH_FP8_GEMM_CONFIG(TB_M, TB_N, TB_K, WP_M, WP_N, WP_K, STAGES) \
     sm89_dispatch_bias<ElementOutput, cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>, \
@@ -611,52 +664,80 @@ void sm89_dispatch_shape_explicit(torch::Tensor& out, const torch::Tensor& mat_a
         // Group 1: CtaShape32x128x64_WarpShape32x32x64
         DISPATCH_FP8_GEMM_GROUP(1, 32, 128, 64, 32, 32, 64, 1);
 
-        // Group 2: CtaShape64x128x64_WarpShape32x64x64
-        DISPATCH_FP8_GEMM_GROUP(2, 64, 128, 64, 32, 64, 64, 7);
+        // // Group 2: CtaShape64x128x64_WarpShape32x64x64
+        // DISPATCH_FP8_GEMM_GROUP(2, 64, 128, 64, 32, 64, 64, 7);
 
-        // Group 3: CtaShape64x64x128_WarpShape32x64x64
-        DISPATCH_FP8_GEMM_GROUP(3, 64, 64, 128, 32, 64, 64, 13);
+        // // Group 3: CtaShape64x64x128_WarpShape32x64x64
+        // DISPATCH_FP8_GEMM_GROUP(3, 64, 64, 128, 32, 64, 64, 13);
 
-        // Group 4: CtaShape64x128x64_WarpShape64x32x64
-        DISPATCH_FP8_GEMM_GROUP(4, 64, 128, 64, 64, 32, 64, 19);
+        // // Group 4: CtaShape64x128x64_WarpShape64x32x64
+        // DISPATCH_FP8_GEMM_GROUP(4, 64, 128, 64, 64, 32, 64, 19);
 
-        // Group 5: CtaShape128x64x64_WarpShape64x32x64
-        DISPATCH_FP8_GEMM_GROUP(5, 128, 64, 64, 64, 32, 64, 25);
+        // // Group 5: CtaShape128x64x64_WarpShape64x32x64
+        // DISPATCH_FP8_GEMM_GROUP(5, 128, 64, 64, 64, 32, 64, 25);
 
-        // Group 6: CtaShape128x128x64_WarpShape64x32x64
-        DISPATCH_FP8_GEMM_GROUP(6, 128, 128, 64, 64, 32, 64, 31);
+        // // Group 6: CtaShape128x128x64_WarpShape64x32x64
+        // DISPATCH_FP8_GEMM_GROUP(6, 128, 128, 64, 64, 32, 64, 31);
 
-        // Group 7: CtaShape128x128x64_WarpShape64x64x64
-        DISPATCH_FP8_GEMM_GROUP(7, 128, 128, 64, 64, 64, 64, 37);
+        // // Group 7: CtaShape128x128x64_WarpShape64x64x64
+        // DISPATCH_FP8_GEMM_GROUP(7, 128, 128, 64, 64, 64, 64, 37);
 
-        // Group 8: CtaShape128x128x64_WarpShape128x32x64
-        DISPATCH_FP8_GEMM_GROUP(8, 128, 128, 64, 128, 32, 64, 43);
+        // // Group 8: CtaShape128x128x64_WarpShape128x32x64
+        // DISPATCH_FP8_GEMM_GROUP(8, 128, 128, 64, 128, 32, 64, 43);
 
-        // Group 9: CtaShape128x256x64_WarpShape64x64x64
-        DISPATCH_FP8_GEMM_GROUP(9, 128, 256, 64, 64, 64, 64, 49);
+        // // Group 9: CtaShape128x256x64_WarpShape64x64x64
+        // DISPATCH_FP8_GEMM_GROUP(9, 128, 256, 64, 64, 64, 64, 49);
 
-        // Group 10: CtaShape256x128x64_WarpShape64x64x64
-        DISPATCH_FP8_GEMM_GROUP(10, 256, 128, 64, 64, 64, 64, 55);
+        // // Group 10: CtaShape256x128x64_WarpShape64x64x64
+        // DISPATCH_FP8_GEMM_GROUP(10, 256, 128, 64, 64, 64, 64, 55);
 
-        // Group 11: CtaShape128x64x128_WarpShape64x32x128
-        DISPATCH_FP8_GEMM_GROUP(11, 128, 64, 128, 64, 32, 128, 61);
+        // // Group 11: CtaShape128x64x128_WarpShape64x32x128
+        // DISPATCH_FP8_GEMM_GROUP(11, 128, 64, 128, 64, 32, 128, 61);
 
-        // Group 12: CtaShape16x256x128_WarpShape16x64x128
-        DISPATCH_FP8_GEMM_GROUP(12, 16, 256, 128, 16, 64, 128, 67);
+        // // Group 12: CtaShape16x256x128_WarpShape16x64x128
+        // DISPATCH_FP8_GEMM_GROUP(12, 16, 256, 128, 16, 64, 128, 67);
 
-        // Group 13: CtaShape16x64x128_WarpShape16x64x64
-        DISPATCH_FP8_GEMM_GROUP(13, 16, 64, 128, 16, 64, 64, 73);
+        // // Group 13: CtaShape16x64x128_WarpShape16x64x64
+        // DISPATCH_FP8_GEMM_GROUP(13, 16, 64, 128, 16, 64, 64, 73);
 
-        // Group 14: CtaShape16x128x64_WarpShape16x64x64
-        DISPATCH_FP8_GEMM_GROUP(14, 16, 128, 64, 16, 64, 64, 79);
+        // // Group 14: CtaShape16x128x64_WarpShape16x64x64
+        // DISPATCH_FP8_GEMM_GROUP(14, 16, 128, 64, 16, 64, 64, 79);
 
-        // Group 15: CtaShape32x64x128_WarpShape16x64x64
-        DISPATCH_FP8_GEMM_GROUP(15, 32, 64, 128, 16, 64, 64, 85);
+        // // Group 15: CtaShape32x64x128_WarpShape16x64x64
+        // DISPATCH_FP8_GEMM_GROUP(15, 32, 64, 128, 16, 64, 64, 85);
         
         default:
             throw std::runtime_error("Invalid config_id: " + std::to_string(config_id));
     }
 #endif
+}
+
+template <typename ElementOutput>
+bool try_load_cached_config(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
+                          const torch::Tensor& scales_a, const torch::Tensor& scales_b,
+                          const c10::optional<torch::Tensor>& bias,
+                          const torch::Dtype& out_dtype, bool is_sm90) {
+    std::string config_path = get_config_path(mat_a.size(1), mat_b.size(1), out_dtype);
+    try {
+        json config = read_json_config(config_path);
+        int current_m = mat_a.size(0);
+        int nearest_m = find_nearest_m(config, current_m);
+        if (nearest_m != -1) {
+            std::string key = "M=" + std::to_string(nearest_m);
+            int config_id = config[key].get<int>();
+            if (is_sm90) {
+                sm90_dispatch_shape_explicit<ElementOutput>(
+                    out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
+            } else {
+                sm89_dispatch_shape_explicit<ElementOutput>(
+                    out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
+            }
+            return true;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to read config, using default dispatch: " << e.what() << std::endl;
+    }
+    return false;
 }
 
 torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b, const torch::Tensor& scales_a,
@@ -695,59 +776,67 @@ torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat
   TORCH_CHECK((out.size(1) * out.element_size()) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
 
   auto sm_version = getSMVersion();
+  // todo: 加上90的profile, 把搜索提出来
   if (sm_version >= 90) {
-        if (out_dtype == torch::kBFloat16) {
-            sm90_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
-        } else {
-            sm90_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
-        }
-  } else if (sm_version == 89) {
         if (is_profile) {
-            std::string config_path = get_config_path(mat_a.size(1), mat_b.size(1), out_dtype);
-            try {
-                json config = read_json_config(config_path);
-                int current_m = mat_a.size(0);
-                int nearest_m = find_nearest_m(config, current_m);
-                if (nearest_m != -1) {
-                    std::string key = "M=" + std::to_string(nearest_m);
-                    int config_id = config[key].get<int>();
-                    if (out_dtype == torch::kBFloat16) {
-                        sm89_dispatch_shape_explicit<cutlass::bfloat16_t>(
-                            out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
-
-                    } else {
-                        sm89_dispatch_shape_explicit<cutlass::half_t>(
-                            out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
-                    }
-                    return out;
+            if (out_dtype == torch::kBFloat16) {
+                if (!try_load_cached_config<cutlass::bfloat16_t>(
+                    out, mat_a, mat_b, scales_a, scales_b, bias, out_dtype, true)) {
+                    sm90_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
                 }
-            } catch (const std::exception& e) {
-                std::cerr << "Failed to read config, using default dispatch: " << e.what() << std::endl;
+            } else {
+                if (!try_load_cached_config<cutlass::half_t>(
+                    out, mat_a, mat_b, scales_a, scales_b, bias, out_dtype, true)) {
+                    sm90_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+                }
+            }
+        } else {
+            if (out_dtype == torch::kBFloat16) {
+                sm90_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+            } else {
+                sm90_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
             }
         }
-        
-        if (out_dtype == torch::kBFloat16) {
-            sm89_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else if (sm_version == 89) {
+        if (is_profile) {
+            if (out_dtype == torch::kBFloat16) {
+                if (!try_load_cached_config<cutlass::bfloat16_t>(
+                    out, mat_a, mat_b, scales_a, scales_b, bias, out_dtype, false)) {
+                    sm89_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+                }
+            } else {
+                if (!try_load_cached_config<cutlass::half_t>(
+                    out, mat_a, mat_b, scales_a, scales_b, bias, out_dtype, false)) {
+                    sm89_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+                }
+            }
         } else {
-            sm89_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+            if (out_dtype == torch::kBFloat16) {
+                sm89_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+            } else {
+                sm89_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+            }
         }
-  } else {
-    TORCH_CHECK_NOT_IMPLEMENTED(false, "No implemented int8_scaled_mm for current compute capability: ", sm_version);
-  }
-
-
-  return out;
+    } else {
+        TORCH_CHECK_NOT_IMPLEMENTED(false, "No implemented int8_scaled_mm for current compute capability: ", sm_version);
+    }
+    return out;
 }
 
-
 template <typename OutType>
-float test_config(int config_id, torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
-    const torch::Tensor& scales_a, const torch::Tensor& scales_b, const c10::optional<torch::Tensor>& bias) {
+float benchmark_gemm_config(int config_id, torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
+    const torch::Tensor& scales_a, const torch::Tensor& scales_b, const c10::optional<torch::Tensor>& bias,
+    bool is_sm90 = false) {
     const int NUM_WARMUP = 25;
     const int NUM_TEST = 100;
+    
     // warmup
     for (int i = 0; i < NUM_WARMUP; i++) {
-        sm89_dispatch_shape_explicit<OutType>(out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
+        if (is_sm90) {
+            sm90_dispatch_shape_explicit<OutType>(out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
+        } else {
+            sm89_dispatch_shape_explicit<OutType>(out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
+        }
     }
     
     float total_time = 0.0f;
@@ -757,7 +846,11 @@ float test_config(int config_id, torch::Tensor& out, const torch::Tensor& mat_a,
     
     for (int i = 0; i < NUM_TEST; i++) {
         cudaEventRecord(start);
-        sm89_dispatch_shape_explicit<OutType>(out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
+        if (is_sm90) {
+            sm90_dispatch_shape_explicit<OutType>(out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
+        } else {
+            sm89_dispatch_shape_explicit<OutType>(out, mat_a, mat_b, scales_a, scales_b, bias, config_id);
+        }
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
         
@@ -773,22 +866,24 @@ float test_config(int config_id, torch::Tensor& out, const torch::Tensor& mat_a,
 }
 
 template <typename OutType>
-int sm89_dispatch_shape_profile(const torch::Tensor& mat_a, const torch::Tensor& mat_b,
+int profile_gemm_configs(const torch::Tensor& mat_a, const torch::Tensor& mat_b,
     const torch::Tensor& scales_a, const torch::Tensor& scales_b, 
-    const torch::Dtype& out_dtype, const c10::optional<torch::Tensor>& bias) {
+    const torch::Dtype& out_dtype, const c10::optional<torch::Tensor>& bias,
+    bool is_sm90 = false) {
     torch::Tensor out = torch::empty({mat_a.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
     float min_time = std::numeric_limits<float>::max();
     int best_config = -1;
+    
+    // 根据架构选择最大配置ID
+    const int max_config_id = is_sm90 ? MAX_CONFIG_ID_90 : MAX_CONFIG_ID_89;
+    
 #ifdef SGL_DEBUG_BUILD
-    for (int i = 1; i <= MAX_CONFIG_ID; i++) {
+    for (int i = 1; i <= max_config_id; i++) {
 #else
-    for (int i = 1; i <= MAX_CONFIG_ID; i++) {
+    for (int i = 1; i <= max_config_id; i++) {
 #endif
         try {
-            float elapsed_time = test_config<OutType>(i, out, mat_a, mat_b, scales_a, scales_b, bias);
-            #ifdef SGL_DEBUG_BUILD
-            std::cout << "batch_size: " << mat_a.size(0) << ", config_id: " << i << ", time: " << elapsed_time << "ms" << std::endl;
-            #endif
+            float elapsed_time = benchmark_gemm_config<OutType>(i, out, mat_a, mat_b, scales_a, scales_b, bias, is_sm90);
             if (elapsed_time < min_time) {
                 min_time = elapsed_time;
                 best_config = i;
@@ -856,10 +951,25 @@ void fp8_scaled_mm_profile(const torch::Tensor& mat_a, const torch::Tensor& mat_
     
     // if need profile, run profile and update config
     if (need_profile) {
-        if (out_dtype == torch::kBFloat16) {
-            best_config = sm89_dispatch_shape_profile<cutlass::bfloat16_t>(mat_a, mat_b, scales_a, scales_b, out_dtype, bias);
-        } else {
-            best_config = sm89_dispatch_shape_profile<cutlass::half_t>(mat_a, mat_b, scales_a, scales_b, out_dtype, bias);
+        if (need_profile) {
+            auto sm_version = getSMVersion();
+            if (sm_version >= 90) {
+                if (out_dtype == torch::kBFloat16) {
+                    best_config = profile_gemm_configs<cutlass::bfloat16_t>(
+                        mat_a, mat_b, scales_a, scales_b, out_dtype, bias, true);
+                } else {
+                    best_config = profile_gemm_configs<cutlass::half_t>(
+                        mat_a, mat_b, scales_a, scales_b, out_dtype, bias, true);
+                }
+            } else if (sm_version == 89) {
+                if (out_dtype == torch::kBFloat16) {
+                    best_config = profile_gemm_configs<cutlass::bfloat16_t>(
+                        mat_a, mat_b, scales_a, scales_b, out_dtype, bias, false);
+                } else {
+                    best_config = profile_gemm_configs<cutlass::half_t>(
+                        mat_a, mat_b, scales_a, scales_b, out_dtype, bias, false);
+                }
+            }
         }
         if (best_config != -1) {
             try {

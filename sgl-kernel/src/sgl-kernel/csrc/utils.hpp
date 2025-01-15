@@ -6,9 +6,14 @@
 #include <filesystem>
 // 在头文件中定义
 #ifdef SGL_DEBUG_BUILD
-constexpr int MAX_CONFIG_ID = 6;  // debug模式下的最大配置ID
+constexpr int MAX_CONFIG_ID_89 = 6;  // debug模式下的最大配置ID
 #else
-constexpr int MAX_CONFIG_ID = 90; // 正常模式下的最大配置ID
+constexpr int MAX_CONFIG_ID_89 = 90; // 正常模式下的最大配置ID
+#endif
+#ifdef SGL_DEBUG_BUILD
+constexpr int MAX_CONFIG_ID_90 = 3; // debug模式下的最大配置ID
+#else
+constexpr int MAX_CONFIG_ID_90 = 96; // 正常模式下的最大配置ID
 #endif
 
 using json = nlohmann::json;
