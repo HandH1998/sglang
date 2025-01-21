@@ -47,9 +47,7 @@ def benchmark(batch_size, provider):
             lambda: sgl_scaled_mm(a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype, bias=None),
             quantiles=quantiles,
         )
-
     gbps = lambda ms: (2 * M * N * K + M * N) * a.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms), gbps(max_ms), gbps(min_ms)
-
 
 benchmark.run(print_data=True, show_plots=True, save_path="bench_fp8_res")

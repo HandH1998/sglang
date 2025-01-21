@@ -3,7 +3,6 @@
 // https://github.com/NVIDIA/TensorRT-LLM/blob/v0.16.0/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm_kernel_template_sm90.h
 
 #pragma once
-#include <chrono>
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -31,7 +30,6 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 
 #include "utils.hpp"
-
 
 using namespace cute;
 
@@ -239,7 +237,7 @@ void sm89_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch
     uint32_t const n = out.size(1);
     uint32_t const np2 = next_pow_2(n);
 
-  if (m == 1) {
+  if (mp2 <= 2) {
     if (np2 <= 8192) {
         return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<16, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>, 7>(out, a, b, scales_a, scales_b, bias);
     } else if (np2 <= 16384) {
@@ -493,7 +491,6 @@ void launch_sm90_fp8_scaled_mm(torch::Tensor& out, const torch::Tensor& a, const
     TORCH_CHECK(can_implement == cutlass::Status::kSuccess)
 
     auto status = gemm_op.run(args, workspace.data_ptr(), stream);
-
     TORCH_CHECK(status == cutlass::Status::kSuccess)
 }
 
@@ -542,8 +539,6 @@ void sm90_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch
 torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b, const torch::Tensor& scales_a,
                              const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
                              const c10::optional<torch::Tensor>& bias) {
-
-
   TORCH_CHECK(mat_a.is_cuda(), "mat_a must be a CUDA tensor");
   TORCH_CHECK(mat_b.is_cuda(), "mat_b must be a CUDA tensor");
   TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
@@ -575,6 +570,7 @@ torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat
   TORCH_CHECK((out.size(1) * out.element_size()) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
 
   auto sm_version = getSMVersion();
+
   if (sm_version >= 90) {
         if (out_dtype == torch::kBFloat16) {
             sm90_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
@@ -590,7 +586,6 @@ torch::Tensor fp8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat
   } else {
     TORCH_CHECK_NOT_IMPLEMENTED(false, "No implemented fp8_scaled_mm for current compute capability: ", sm_version);
   }
-
 
   return out;
 }
