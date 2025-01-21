@@ -3,6 +3,7 @@ from pathlib import Path
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
+
 root = Path(__file__).parent.resolve()
 
 
@@ -23,11 +24,13 @@ def update_wheel_platform_tag():
 
 
 cutlass = root / "3rdparty" / "cutlass"
+
 include_dirs = [
     cutlass.resolve() / "include",
     cutlass.resolve() / "tools" / "util" / "include",
     root / "src" / "sgl-kernel" / "csrc",
 ]
+
 nvcc_flags = [
     "-O3",
     "-Xcompiler",
@@ -35,11 +38,16 @@ nvcc_flags = [
     "-gencode=arch=compute_75,code=sm_75",
     "-gencode=arch=compute_80,code=sm_80",
     "-gencode=arch=compute_89,code=sm_89",
+    "-gencode=arch=compute_90a,code=sm_90a",
     "-gencode=arch=compute_90,code=sm_90",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF2_OPERATORS__",
 ]
+
+
 cxx_flags = ["-O3"]
+
+
 libraries = ["c10", "torch", "torch_python"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib"]
 ext_modules = [

@@ -5,7 +5,6 @@ from sgl_kernel.ops._kernels import int8_scaled_mm as _int8_scaled_mm
 from sgl_kernel.ops._kernels import fp8_scaled_mm as _fp8_scaled_mm
 from sgl_kernel.ops._kernels import moe_align_block_size as _moe_align_block_size
 
-
 def init_custom_reduce(rank_id, num_devices, buffers, barrier_in, barrier_out):
     return _init_custom_ar(rank_id, num_devices, buffers, barrier_in, barrier_out)
 
