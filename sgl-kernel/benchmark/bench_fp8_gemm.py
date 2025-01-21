@@ -65,11 +65,11 @@ def benchmark(batch_size, provider):
     quantiles = [0.5, 0.2, 0.8]
 
     dtype = torch.float16 if "fp16" in provider else torch.bfloat16
-
+    bias = torch.randn((N,), device="cuda", dtype=dtype)
     if "vllm-fp8" in provider:
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: vllm_scaled_mm(
-                a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype
+                a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype, bias=bias
             ),
             quantiles=quantiles,
         )
@@ -77,7 +77,7 @@ def benchmark(batch_size, provider):
         do_profile(dtype, N, K)
         try:
             ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: sgl_scaled_mm(a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype, bias=None, is_profile=True),
+                lambda: sgl_scaled_mm(a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype, bias=bias, is_profile=True),
                 quantiles=quantiles,
             )
         except RuntimeError as e:
@@ -85,7 +85,7 @@ def benchmark(batch_size, provider):
             ms, min_ms, max_ms = 1, 1, 1
     elif "sglang-fp8" in provider:
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: sgl_scaled_mm(a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype, bias=None, is_profile=False),
+            lambda: sgl_scaled_mm(a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype, bias=bias, is_profile=False),
             quantiles=quantiles,
         )
     elif provider == "torch-fp8":
@@ -104,6 +104,7 @@ def benchmark(batch_size, provider):
                     scale_a=scale_a_2d,
                     scale_b=scale_b_2d,
                     use_fast_accum=True,
+                    bias=bias,
                 ),
                 quantiles=quantiles,
             )

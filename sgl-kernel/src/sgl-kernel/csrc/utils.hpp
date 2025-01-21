@@ -13,7 +13,7 @@ constexpr int MAX_CONFIG_ID_89 = 90; // 正常模式下的最大配置ID
 #ifdef SGL_DEBUG_BUILD
 constexpr int MAX_CONFIG_ID_90 = 3; // debug模式下的最大配置ID
 #else
-constexpr int MAX_CONFIG_ID_90 = 96; // 正常模式下的最大配置ID
+constexpr int MAX_CONFIG_ID_90 = 144; // 正常模式下的最大配置ID
 #endif
 
 using json = nlohmann::json;
