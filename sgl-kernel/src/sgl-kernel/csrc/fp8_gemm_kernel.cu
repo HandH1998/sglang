@@ -240,7 +240,7 @@ void sm89_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch
     uint32_t const n = out.size(1);
     uint32_t const np2 = next_pow_2(n);
 
-  if (mp2 <= 2) {
+  if (mp2 <= 1) {
     if (np2 <= 8192) {
         return sm89_dispatch_bias<OutType, cutlass::gemm::GemmShape<16, 64, 128>, cutlass::gemm::GemmShape<16, 64, 64>, 7>(out, a, b, scales_a, scales_b, bias);
     } else if (np2 <= 16384) {
@@ -526,17 +526,31 @@ void sm90_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch
                              const torch::Tensor& scales_b,
                              const c10::optional<torch::Tensor>& bias) {
     uint32_t const m = a.size(0);
-    uint32_t const mp2 =
-        std::max(static_cast<uint32_t>(64), next_pow_2(m));  // next power of 2
+    uint32_t const mp2 = next_pow_2(m);
 
-    if (mp2 <= 64) {
-        // m in [1, 64]
-        return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _8, _1>>(out, a, b, scales_a, scales_b, bias);
+    if (mp2 <= 1) {
+        // m == 1
+        return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _4, _1>>(out, a, b, scales_a, scales_b, bias);
+    } else if (mp2 <= 16) {
+        // m in [2, 16]
+        return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _4, _1>>(out, a, b, scales_a, scales_b, bias);
+    } else if (mp2 <= 64) {
+        // m in (16, 64]
+        return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _4, _1>>(out, a, b, scales_a, scales_b, bias);
     } else if (mp2 <= 128) {
         // m in (64, 128]
-        return sm90_dispatch_bias<OutType, Shape<_64, _128, _128>, Shape<_2, _1, _1>>(out, a, b, scales_a, scales_b, bias);
+        return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _1, _1>>(out, a, b, scales_a, scales_b, bias);
+    } else if (mp2 <= 256) {
+        // m in (128, 256]
+        return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _1, _1>>(out, a, b, scales_a, scales_b, bias);
+    } else if (mp2 <= 512) {
+        // m in (256, 512]
+        return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_1, _1, _1>>(out, a, b, scales_a, scales_b, bias);
+    } else if (mp2 <= 1024) {
+        // m in (512, 1024]
+        return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_1, _1, _1>>(out, a, b, scales_a, scales_b, bias);
     } else {
-        // m in (128, inf)
+        // m in (1024, inf)
         return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_2, _1, _1>>(out, a, b, scales_a, scales_b, bias);
     }
 }
