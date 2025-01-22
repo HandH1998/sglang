@@ -528,26 +528,14 @@ void sm90_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch
     uint32_t const m = a.size(0);
     uint32_t const mp2 = next_pow_2(m);
 
-    if (mp2 <= 1) {
-        // m == 1
+    if (mp2 <= 64) {
+        // m in [1, 64]
         return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _4, _1>>(out, a, b, scales_a, scales_b, bias);
-    } else if (mp2 <= 16) {
-        // m in [2, 16]
-        return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _4, _1>>(out, a, b, scales_a, scales_b, bias);
-    } else if (mp2 <= 64) {
-        // m in (16, 64]
-        return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _4, _1>>(out, a, b, scales_a, scales_b, bias);
-    } else if (mp2 <= 128) {
-        // m in (64, 128]
-        return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _1, _1>>(out, a, b, scales_a, scales_b, bias);
     } else if (mp2 <= 256) {
-        // m in (128, 256]
+        // m in (64, 256]
         return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _1, _1>>(out, a, b, scales_a, scales_b, bias);
-    } else if (mp2 <= 512) {
-        // m in (256, 512]
-        return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_1, _1, _1>>(out, a, b, scales_a, scales_b, bias);
     } else if (mp2 <= 1024) {
-        // m in (512, 1024]
+        // m in (256, 1024]
         return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_1, _1, _1>>(out, a, b, scales_a, scales_b, bias);
     } else {
         // m in (1024, inf)
