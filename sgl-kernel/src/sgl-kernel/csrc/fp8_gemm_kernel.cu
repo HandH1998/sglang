@@ -348,7 +348,7 @@ struct DeviceGemmFp8RowwiseSm90
     using ArchTag = cutlass::arch::Sm90;         // Tag indicating the minimum SM that supports the intended feature
     using OperatorClass = cutlass::arch::OpClassTensorOp; // Operator class tag
     using TileShape = CTAShape;                           // Threadblock-level tile size
-    using TileScheduler = TileSchedulerType;
+    // using TileScheduler = TileSchedulerType;
 
     static constexpr bool PONG = false;
     static constexpr bool FAST_ACCUM = true;
@@ -398,23 +398,19 @@ struct DeviceGemmFp8RowwiseSm90
     using DefaultSchedule = cutlass::gemm::KernelTmaWarpSpecialized;
     using PongSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
     using FastDefaultSchedule = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
-    using FastPongSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum;
 
     using SlowAccum = DefaultSchedule;
     using FastAccum = FastDefaultSchedule;
-    // using MainLoopSchedule = cute::conditional_t<FAST_ACCUM, FastAccum, SlowAccum>;
-    using MainLoopSchedule = cute::conditional_t<FAST_ACCUM,
-    cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum,  // 更激进的ping-pong
-    cutlass::gemm::KernelTmaWarpSpecializedCooperative>; 
+
 
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<ArchTag, OperatorClass, ElementA,
         LayoutA, 16, ElementB, LayoutB, 16, ElementAccumulator, TileShape, ClusterShape,
         cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
             sizeof(typename CollectiveEpilogue::SharedStorage) * 2)>,
-        FastPongSchedule>::CollectiveOp;
+        MainloopScheduleType>::CollectiveOp;
 
     using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, // Indicates ProblemShape
-        CollectiveMainloop, CollectiveEpilogue, TileScheduler>;
+        CollectiveMainloop, CollectiveEpilogue, TileSchedulerType>;
 
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
@@ -501,25 +497,45 @@ void launch_sm90_fp8_scaled_mm(torch::Tensor& out, const torch::Tensor& a, const
     TORCH_CHECK(status == cutlass::Status::kSuccess)
 }
 
+// 首先定义一个配置结构体
+template<bool FastAccum, bool UsePersistentScheduler>
+struct GemmScheduleConfig {
+    using MainloopScheduleType = typename std::conditional<FastAccum,
+        cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum,
+        cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum>::type;
+        
+    using TileSchedulerType = typename std::conditional<UsePersistentScheduler,
+        cutlass::gemm::PersistentScheduler,
+        void>::type;
+};
 
-template <typename OutType, typename CTAShape, typename ClusterShape>
-void sm90_dispatch_bias(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& scales_a,
-                             const torch::Tensor& scales_b,
-                             const c10::optional<torch::Tensor>& bias) {
+// 然后修改sm90_dispatch_bias函数
+template <typename OutType, typename CTAShape, typename ClusterShape, typename MainloopScheduleType, typename TileSchedulerType>
+void sm90_dispatch_bias(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b, 
+                       const torch::Tensor& scales_a, const torch::Tensor& scales_b,
+                       const c10::optional<torch::Tensor>& bias,
+                       bool fast_accum = true,
+                       bool use_persistent = false) {
     using ElementInput = cutlass::float_e4m3_t;
     using ElementOutput = OutType;
     using AccumElementType = float;
-    using MainloopScheduleType = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
     using EpilogueScheduleType = cutlass::epilogue::TmaWarpSpecialized;
-    // using TileSchedulerType = cutlass::gemm::PersistentScheduler;
-    using TileSchedulerType = void;
+    
     if (bias) {
-        using Gemm = typename DeviceGemmFp8RowwiseSm90<ElementInput, ElementOutput, AccumElementType, CTAShape,
-            ClusterShape, MainloopScheduleType, EpilogueScheduleType, TileSchedulerType, true>::Gemm;
+        using Gemm = typename DeviceGemmFp8RowwiseSm90<ElementInput, ElementOutput, AccumElementType, 
+            CTAShape, ClusterShape, 
+            MainloopScheduleType,
+            EpilogueScheduleType,
+            TileSchedulerType,
+            true>::Gemm;
         return launch_sm90_fp8_scaled_mm<Gemm, true>(out, a, b, scales_a, scales_b, bias);
     } else {
-        using Gemm = typename DeviceGemmFp8RowwiseSm90<ElementInput, ElementOutput, AccumElementType, CTAShape,
-            ClusterShape, MainloopScheduleType, EpilogueScheduleType, TileSchedulerType, false>::Gemm;
+        using Gemm = typename DeviceGemmFp8RowwiseSm90<ElementInput, ElementOutput, AccumElementType,
+            CTAShape, ClusterShape,
+            MainloopScheduleType, 
+            EpilogueScheduleType,
+            TileSchedulerType,
+            false>::Gemm;
         return launch_sm90_fp8_scaled_mm<Gemm, false>(out, a, b, scales_a, scales_b, bias);
     }
 }
@@ -531,82 +547,144 @@ void sm90_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch
     uint32_t const m = a.size(0);
     uint32_t const mp2 =
         std::max(static_cast<uint32_t>(64), next_pow_2(m));  // next power of 2
-
+    using MainloopScheduleType = cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum;
+    using TileSchedulerType = cutlass::gemm::PersistentScheduler;
     if (mp2 <= 64) {
         // m in [1, 64]
-        return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _8, _1>>(out, a, b, scales_a, scales_b, bias);
+        return sm90_dispatch_bias<OutType, Shape<_64, _64, _128>, Shape<_1, _8, _1>, MainloopScheduleType, TileSchedulerType>(out, a, b, scales_a, scales_b, bias);
     } else if (mp2 <= 128) {
         // m in (64, 128]
-        return sm90_dispatch_bias<OutType, Shape<_64, _128, _128>, Shape<_2, _1, _1>>(out, a, b, scales_a, scales_b, bias);
+        return sm90_dispatch_bias<OutType, Shape<_64, _128, _128>, Shape<_2, _1, _1>, MainloopScheduleType, TileSchedulerType>(out, a, b, scales_a, scales_b, bias);
     } else {
         // m in (128, inf)
-        return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_2, _1, _1>>(out, a, b, scales_a, scales_b, bias);
+        return sm90_dispatch_bias<OutType, Shape<_128, _128, _128>, Shape<_2, _1, _1>, MainloopScheduleType, TileSchedulerType>(out, a, b, scales_a, scales_b, bias);
     }
 }
 
 // define macro for dispatch
-#define DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, CLUSTER_M, CLUSTER_N, CLUSTER_K) \
+#define DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, CLUSTER_M, CLUSTER_N, CLUSTER_K, MainloopScheduleType, TileSchedulerType) \
     sm90_dispatch_bias<ElementOutput, Shape<CTA_M, CTA_N, CTA_K>, \
-        Shape<CLUSTER_M, CLUSTER_N, CLUSTER_K>>(out, mat_a, mat_b, scales_a, scales_b, bias)
+        Shape<CLUSTER_M, CLUSTER_N, CLUSTER_K>, MainloopScheduleType, TileSchedulerType>(out, mat_a, mat_b, scales_a, scales_b, bias)
+        
+// 修改DISPATCH_FP8_GEMM_SM90_GROUP宏以包含所有组合
+#define DISPATCH_FP8_GEMM_SM90_GROUP(GROUP_ID, CTA_M, CTA_N, CTA_K, BASE_CASE, MainloopScheduleType, TileSchedulerType) \
+    case BASE_CASE:     DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _1, _1, _1, MainloopScheduleType, TileSchedulerType); break; \
+    case BASE_CASE + 1: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _2, _1, _1, MainloopScheduleType, TileSchedulerType); break; \
+    case BASE_CASE + 2: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _1, _2, _1, MainloopScheduleType, TileSchedulerType); break; \
+    case BASE_CASE + 3: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _2, _2, _1, MainloopScheduleType, TileSchedulerType); break; \
+    case BASE_CASE + 4: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _1, _4, _1, MainloopScheduleType, TileSchedulerType); break; \
+    case BASE_CASE + 5: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _4, _1, _1, MainloopScheduleType, TileSchedulerType); break; \
+    case BASE_CASE + 6: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _2, _4, _1, MainloopScheduleType, TileSchedulerType); break; \
+    case BASE_CASE + 7: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _4, _2, _1, MainloopScheduleType, TileSchedulerType); break; \
+    case BASE_CASE + 8: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _4, _4, _1, MainloopScheduleType, TileSchedulerType); break; \
+    case BASE_CASE + 9: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _8, _1, _1, MainloopScheduleType, TileSchedulerType); break; \
+    case BASE_CASE + 10: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _8, _2, _1, MainloopScheduleType, TileSchedulerType); break; \
+    case BASE_CASE + 11: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _1, _8, _1, MainloopScheduleType, TileSchedulerType); break;
 
 // generate all stages for a group of configs
-#define DISPATCH_FP8_GEMM_SM90_GROUP(GROUP_ID, CTA_M, CTA_N, CTA_K, BASE_CASE) \
-    case BASE_CASE:     DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _1, _1, _1); break; \
-    case BASE_CASE + 1: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _2, _1, _1); break; \
-    case BASE_CASE + 2: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _1, _2, _1); break; \
-    case BASE_CASE + 3: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _2, _2, _1); break; \
-    case BASE_CASE + 4: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _1, _4, _1); break; \
-    case BASE_CASE + 5: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _4, _1, _1); break; \
-    case BASE_CASE + 6: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _2, _4, _1); break; \
-    case BASE_CASE + 7: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _4, _2, _1); break; \
-    case BASE_CASE + 8: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _4, _4, _1); break; \
-    case BASE_CASE + 9: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _8, _1, _1); break; \
-    case BASE_CASE + 10: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _8, _2, _1); break; \
-    case BASE_CASE + 11: DISPATCH_FP8_GEMM_SM90_CONFIG(CTA_M, CTA_N, CTA_K, _1, _8, _1); break;
-
 template <typename ElementOutput>
 void sm90_dispatch_shape_explicit(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
                             const torch::Tensor& scales_a, const torch::Tensor& scales_b,
                             const c10::optional<torch::Tensor>& bias,
                             int config_id) {
+    using MainloopScheduleType1 = cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum;
+    using TileSchedulerType1 = cutlass::gemm::PersistentScheduler;
+    using MainloopScheduleType2 = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
+    using TileSchedulerType2 = void;
 #ifdef SGL_DEBUG_BUILD
     switch(config_id) {
         case 1:
-            DISPATCH_FP8_GEMM_SM90_CONFIG(_64, _64, _128, _1, _8, _1);
+            DISPATCH_FP8_GEMM_SM90_CONFIG(_64, _64, _128, _1, _8, _1, MainloopScheduleType1, TileSchedulerType1);
             break;
         case 2:
-            DISPATCH_FP8_GEMM_SM90_CONFIG(_64, _128, _128, _2, _1, _1);
+            DISPATCH_FP8_GEMM_SM90_CONFIG(_64, _128, _128, _2, _1, _1, MainloopScheduleType1, TileSchedulerType1);
             break;
         case 3:
-            DISPATCH_FP8_GEMM_SM90_CONFIG(_128, _128, _128, _2, _1, _1);
+            DISPATCH_FP8_GEMM_SM90_CONFIG(_128, _128, _128, _2, _1, _1, MainloopScheduleType1, TileSchedulerType1);
             break;
         default:
             throw std::runtime_error("Invalid config_id in debug mode: " + std::to_string(config_id));
     }
 #else
     switch(config_id) {
-        // Group 1: Small tiles
-        DISPATCH_FP8_GEMM_SM90_GROUP(1, _64, _64, _64, 1);
-        DISPATCH_FP8_GEMM_SM90_GROUP(2, _64, _64, _128, 13);
-        DISPATCH_FP8_GEMM_SM90_GROUP(3, _64, _128, _64, 25);
+        // Group 1: Small tiles (48 configs per group = 12 original configs * 4 combinations)
+        DISPATCH_FP8_GEMM_SM90_GROUP(1, _64, _64, _64, 1, MainloopScheduleType1, TileSchedulerType1);
+        DISPATCH_FP8_GEMM_SM90_GROUP(2, _64, _64, _128, 13, MainloopScheduleType1, TileSchedulerType1);
+        DISPATCH_FP8_GEMM_SM90_GROUP(3, _64, _128, _64, 25, MainloopScheduleType1, TileSchedulerType1);
         
         // Group 2: Medium tiles
-        DISPATCH_FP8_GEMM_SM90_GROUP(4, _128, _64, _64, 37);
-        DISPATCH_FP8_GEMM_SM90_GROUP(5, _128, _128, _64, 49);
-        DISPATCH_FP8_GEMM_SM90_GROUP(6, _128, _128, _128, 61);
+        DISPATCH_FP8_GEMM_SM90_GROUP(4, _128, _64, _64, 37, MainloopScheduleType1, TileSchedulerType1);
+        DISPATCH_FP8_GEMM_SM90_GROUP(5, _128, _128, _64, 49, MainloopScheduleType1, TileSchedulerType1);
+        DISPATCH_FP8_GEMM_SM90_GROUP(6, _128, _128, _128, 61, MainloopScheduleType1, TileSchedulerType1);
         
         // Group 3: Large tiles
-        DISPATCH_FP8_GEMM_SM90_GROUP(7, _128, _256, _64, 73);
-        DISPATCH_FP8_GEMM_SM90_GROUP(8, _256, _128, _64, 85);
-        DISPATCH_FP8_GEMM_SM90_GROUP(9, _256, _256, _64, 97);
+        DISPATCH_FP8_GEMM_SM90_GROUP(7, _128, _256, _64, 73, MainloopScheduleType1, TileSchedulerType1);
+        DISPATCH_FP8_GEMM_SM90_GROUP(8, _256, _128, _64, 85, MainloopScheduleType1, TileSchedulerType1);
+        DISPATCH_FP8_GEMM_SM90_GROUP(9, _256, _256, _64, 97, MainloopScheduleType1, TileSchedulerType1);
         
         // Group 4: Extra large tiles
-        DISPATCH_FP8_GEMM_SM90_GROUP(10, _256, _128, _128, 109);
-        DISPATCH_FP8_GEMM_SM90_GROUP(11, _128, _256, _128, 121);
-        DISPATCH_FP8_GEMM_SM90_GROUP(12, _256, _256, _128, 133);
-        // DISPATCH_FP8_GEMM_SM90_GROUP(13, _128, _128, _128, 97);
-        // DISPATCH_FP8_GEMM_SM90_GROUP(14, _256, _256, _128, 105);
-        // DISPATCH_FP8_GEMM_SM90_GROUP(15, _512, _128, _64, 113);
+        DISPATCH_FP8_GEMM_SM90_GROUP(10, _256, _128, _128, 109, MainloopScheduleType1, TileSchedulerType1);
+        DISPATCH_FP8_GEMM_SM90_GROUP(11, _128, _256, _128, 121, MainloopScheduleType1, TileSchedulerType1);
+        DISPATCH_FP8_GEMM_SM90_GROUP(12, _256, _256, _128, 133, MainloopScheduleType1, TileSchedulerType1);
+
+        DISPATCH_FP8_GEMM_SM90_GROUP(13, _64, _64, _64, 145, MainloopScheduleType1, TileSchedulerType2);
+        DISPATCH_FP8_GEMM_SM90_GROUP(14, _64, _64, _128, 157, MainloopScheduleType1, TileSchedulerType2);
+        DISPATCH_FP8_GEMM_SM90_GROUP(15, _64, _128, _64, 169, MainloopScheduleType1, TileSchedulerType2);
+        
+        // Group 2: Medium tiles
+        DISPATCH_FP8_GEMM_SM90_GROUP(16, _128, _64, _64, 181, MainloopScheduleType1, TileSchedulerType2);
+        DISPATCH_FP8_GEMM_SM90_GROUP(17, _128, _128, _64, 193, MainloopScheduleType1, TileSchedulerType2);
+        DISPATCH_FP8_GEMM_SM90_GROUP(18, _128, _128, _128, 205, MainloopScheduleType1, TileSchedulerType2);
+        
+        // Group 3: Large tiles
+        DISPATCH_FP8_GEMM_SM90_GROUP(19, _128, _256, _64, 217, MainloopScheduleType1, TileSchedulerType2);
+        DISPATCH_FP8_GEMM_SM90_GROUP(20, _256, _128, _64, 229, MainloopScheduleType1, TileSchedulerType2);
+        DISPATCH_FP8_GEMM_SM90_GROUP(21, _256, _256, _64, 241, MainloopScheduleType1, TileSchedulerType2);
+        
+        // Group 4: Extra large tiles
+        DISPATCH_FP8_GEMM_SM90_GROUP(22, _256, _128, _128, 253, MainloopScheduleType1, TileSchedulerType2);
+        DISPATCH_FP8_GEMM_SM90_GROUP(23, _128, _256, _128, 265, MainloopScheduleType1, TileSchedulerType2);
+        DISPATCH_FP8_GEMM_SM90_GROUP(24, _256, _256, _128, 277, MainloopScheduleType1, TileSchedulerType2);
+        // Group 5: Small tiles with MainloopScheduleType2
+        DISPATCH_FP8_GEMM_SM90_GROUP(25, _64, _64, _64, 289, MainloopScheduleType2, TileSchedulerType1);
+        DISPATCH_FP8_GEMM_SM90_GROUP(26, _64, _64, _128, 301, MainloopScheduleType2, TileSchedulerType1);
+        DISPATCH_FP8_GEMM_SM90_GROUP(27, _64, _128, _64, 313, MainloopScheduleType2, TileSchedulerType1);
+        
+        // Group 6: Medium tiles with MainloopScheduleType2
+        DISPATCH_FP8_GEMM_SM90_GROUP(28, _128, _64, _64, 325, MainloopScheduleType2, TileSchedulerType1);
+        DISPATCH_FP8_GEMM_SM90_GROUP(29, _128, _128, _64, 337, MainloopScheduleType2, TileSchedulerType1);
+        DISPATCH_FP8_GEMM_SM90_GROUP(30, _128, _128, _128, 349, MainloopScheduleType2, TileSchedulerType1);
+        
+        // Group 7: Large tiles with MainloopScheduleType2
+        DISPATCH_FP8_GEMM_SM90_GROUP(31, _128, _256, _64, 361, MainloopScheduleType2, TileSchedulerType1);
+        DISPATCH_FP8_GEMM_SM90_GROUP(32, _256, _128, _64, 373, MainloopScheduleType2, TileSchedulerType1);
+        DISPATCH_FP8_GEMM_SM90_GROUP(33, _256, _256, _64, 385, MainloopScheduleType2, TileSchedulerType1);
+        
+        // Group 8: Extra large tiles with MainloopScheduleType2
+        DISPATCH_FP8_GEMM_SM90_GROUP(34, _256, _128, _128, 397, MainloopScheduleType2, TileSchedulerType1);
+        DISPATCH_FP8_GEMM_SM90_GROUP(35, _128, _256, _128, 409, MainloopScheduleType2, TileSchedulerType1);
+        DISPATCH_FP8_GEMM_SM90_GROUP(36, _256, _256, _128, 421, MainloopScheduleType2, TileSchedulerType1);
+
+        // Group 9: Small tiles with MainloopScheduleType2 and TileSchedulerType2
+        DISPATCH_FP8_GEMM_SM90_GROUP(37, _64, _64, _64, 433, MainloopScheduleType2, TileSchedulerType2);
+        DISPATCH_FP8_GEMM_SM90_GROUP(38, _64, _64, _128, 445, MainloopScheduleType2, TileSchedulerType2);
+        DISPATCH_FP8_GEMM_SM90_GROUP(39, _64, _128, _64, 457, MainloopScheduleType2, TileSchedulerType2);
+        
+        // Group 10: Medium tiles with MainloopScheduleType2 and TileSchedulerType2
+        DISPATCH_FP8_GEMM_SM90_GROUP(40, _128, _64, _64, 469, MainloopScheduleType2, TileSchedulerType2);
+        DISPATCH_FP8_GEMM_SM90_GROUP(41, _128, _128, _64, 481, MainloopScheduleType2, TileSchedulerType2);
+        DISPATCH_FP8_GEMM_SM90_GROUP(42, _128, _128, _128, 493, MainloopScheduleType2, TileSchedulerType2);
+        
+        // Group 11: Large tiles with MainloopScheduleType2 and TileSchedulerType2
+        DISPATCH_FP8_GEMM_SM90_GROUP(43, _128, _256, _64, 505, MainloopScheduleType2, TileSchedulerType2);
+        DISPATCH_FP8_GEMM_SM90_GROUP(44, _256, _128, _64, 517, MainloopScheduleType2, TileSchedulerType2);
+        DISPATCH_FP8_GEMM_SM90_GROUP(45, _256, _256, _64, 529, MainloopScheduleType2, TileSchedulerType2);
+        
+        // Group 12: Extra large tiles with MainloopScheduleType2 and TileSchedulerType2
+        DISPATCH_FP8_GEMM_SM90_GROUP(46, _256, _128, _128, 541, MainloopScheduleType2, TileSchedulerType2);
+        DISPATCH_FP8_GEMM_SM90_GROUP(47, _128, _256, _128, 553, MainloopScheduleType2, TileSchedulerType2);
+        DISPATCH_FP8_GEMM_SM90_GROUP(48, _256, _256, _128, 565, MainloopScheduleType2, TileSchedulerType2);
+    
         default:
             throw std::runtime_error("Invalid config_id: " + std::to_string(config_id));
     }
@@ -872,11 +950,7 @@ int profile_gemm_configs(const torch::Tensor& mat_a, const torch::Tensor& mat_b,
     // 根据架构选择最大配置ID
     const int max_config_id = is_sm90 ? MAX_CONFIG_ID_90 : MAX_CONFIG_ID_89;
     
-#ifdef SGL_DEBUG_BUILD
     for (int i = 1; i <= max_config_id; i++) {
-#else
-    for (int i = 1; i <= max_config_id; i++) {
-#endif
         try {
             float elapsed_time = benchmark_gemm_config<OutType>(i, out, mat_a, mat_b, scales_a, scales_b, bias, is_sm90);
             if (elapsed_time < min_time) {
