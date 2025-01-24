@@ -141,6 +141,7 @@ def _static_quant_fp8(
     # Pointers to inputs and output
     y_ptr,
     y_q_ptr,
+    y_max_ptr,
     y_s_ptr,
     y_s_repeat_ptr,
     # Stride of input
@@ -153,6 +154,7 @@ def _static_quant_fp8(
     # Meta-parameters
     BLOCK: tl.constexpr,
     REPEAT_SCALE: tl.constexpr,
+    RESCALE: tl.constexpr,
 ):
     """A Triton-accelerated function to perform quantization using the given scale on a
     tensor
@@ -170,19 +172,26 @@ def _static_quant_fp8(
     mask = cols < N
 
     y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    y_s = tl.load(y_s_ptr).to(tl.float32)
+    if RESCALE:
+        y_s = tl.load(y_max_ptr).to(tl.float32) / fp8_max
+    else:
+        y_s = tl.load(y_s_ptr).to(tl.float32)
     y_s_inv = 1.0 / y_s
     y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
     if REPEAT_SCALE:
         tl.store(y_s_repeat_ptr, y_s)
+    if RESCALE and g_id == 0:
+        tl.store(y_s_ptr, y_s)
 
 
 def static_quant_fp8(
     x: torch.Tensor,
     x_s: torch.Tensor,
+    x_max: torch.Tensor = None,
     repeat_scale: bool = False,
+    rescale: bool = False,
     dtype: torch.dtype = fp8_type_,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Function to perform static quantization using the given scale on an input tensor `x`.
@@ -193,7 +202,9 @@ def static_quant_fp8(
     Args:
         x: The input tenosr with ndim >= 2.
         x_s: The quantization scale.
+        x_max: The max vlaue of x.
         repeat_scale: Whether to broadcast per-tensor scale to per-channel scale.
+        rescale: Whether to calculate the quantization scale with the given x_max.
         dtype: The dype of output tensor.
 
     Returns:
@@ -228,6 +239,7 @@ def static_quant_fp8(
     _static_quant_fp8[(M,)](
         x,
         x_q,
+        x_max,
         x_s,
         x_s_repeat,
         N,
@@ -236,11 +248,20 @@ def static_quant_fp8(
         fp8_max=fp8_max,
         BLOCK=BLOCK,
         REPEAT_SCALE=repeat_scale,
+        RESCALE=rescale,
         num_warps=num_warps,
         num_stages=num_stages,
     )
     x_s = x_s_repeat if repeat_scale else x_s
     return x_q, x_s
+
+
+def per_tensor_quant_fp8(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x_max = x.max()
+    x_s = torch.empty(1, device=x.device, dtype=torch.float32)
+    return static_quant_fp8(x, x_s, x_max, rescale=True)
 
 
 @triton.jit

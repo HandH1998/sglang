@@ -6,6 +6,7 @@ import torch
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.quantization.fp8_kernel import (
+    per_tensor_quant_fp8,
     per_token_group_quant_fp8,
     static_quant_fp8,
     w8a8_block_fp8_matmul,
@@ -84,6 +85,69 @@ class TestPerTokenGroupQuantFP8(unittest.TestCase):
                 seed=params[4],
             ):
                 self._per_token_group_quant_fp8(*params)
+
+
+# For test
+def native_per_tensor_quant_fp8(x, eps=1e-10, dtype=torch.float8_e4m3fn):
+    """Function to perform per-tensor quantization on an input tensor `x` using native torch.
+
+    It converts the tensor values into float8 values and returns the
+    quantized tensor along with the scaling factor used for quantization.
+    Note that only `torch.float8_e4m3fn` is supported for now.
+    """
+    assert x.is_contiguous(), "`x` is not contiguous"
+
+    finfo = torch.finfo(dtype)
+    fp8_min = finfo.min
+    fp8_max = finfo.max
+
+    amax = x.abs().max().clamp(min=eps).to(torch.float32)
+    x_s = amax / fp8_max
+    x_q = (x / x_s).clamp(min=fp8_min, max=fp8_max).to(dtype)
+
+    return x_q, x_s
+
+
+class TestPerTensorQuantFP8(unittest.TestCase):
+    DTYPES = [torch.half, torch.bfloat16, torch.float32]
+    NUM_TOKENS = [7, 83, 2048]
+    D = [512, 4096, 5120, 13824]
+    SEEDS = [0]
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+        torch.set_default_device("cuda")
+
+    def _per_tensor_quant_fp8(self, num_tokens, d, dtype, seed):
+        torch.manual_seed(seed)
+
+        x = torch.rand(num_tokens, d, dtype=dtype)
+
+        with torch.inference_mode():
+            ref_out, ref_scale = native_per_tensor_quant_fp8(x)
+            out, scale = per_tensor_quant_fp8(x)
+
+        self.assertTrue(
+            torch.allclose(out.to(torch.float32), ref_out.to(torch.float32), rtol=0.50)
+        )
+        self.assertTrue(torch.allclose(scale, ref_scale))
+
+    def test_per_tensor_quant_fp8(self):
+        for params in itertools.product(
+            self.NUM_TOKENS,
+            self.D,
+            self.DTYPES,
+            self.SEEDS,
+        ):
+            with self.subTest(
+                num_tokens=params[0],
+                d=params[1],
+                dtype=params[2],
+                seed=params[3],
+            ):
+                self._per_tensor_quant_fp8(*params)
 
 
 # For test
