@@ -6,6 +6,7 @@ import functools
 import json
 import logging
 import orjson
+
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -17,6 +18,7 @@ from vllm import _custom_ops as ops
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+
 from sglang.srt.utils import direct_register_custom_op, get_device_name, is_hip
 
 is_hip_flag = is_hip()
@@ -175,7 +177,6 @@ def fused_moe_kernel(
         else:
             a_scale = tl.load(a_scale_ptr)
             b_scale = tl.load(b_scale_ptr + off_experts)
-            
     if use_int8_w8a8:
         if per_column:
             # 加载权重的per-column scale
@@ -187,6 +188,7 @@ def fused_moe_kernel(
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
             a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)
             
+
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
@@ -526,6 +528,7 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None
     elif use_int8_w8a8:
         A, A_scale = per_token_quant_int8(A)
+
     else:
         assert A_scale is None
         assert B_scale is None
@@ -540,6 +543,7 @@ def invoke_fused_moe_kernel(
         even_Ks = True
     else:
         even_Ks = False
+
     fused_moe_kernel[grid](
         A,
         B,
