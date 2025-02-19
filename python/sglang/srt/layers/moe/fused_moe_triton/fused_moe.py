@@ -5,6 +5,7 @@
 import functools
 import json
 import logging
+import orjson
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -15,6 +16,7 @@ from vllm import _custom_ops as ops
 
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.utils import direct_register_custom_op, get_device_name, is_hip
 
 is_hip_flag = is_hip()
@@ -86,8 +88,10 @@ def fused_moe_kernel(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
+    use_int8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
+    per_column: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -109,6 +113,8 @@ def fused_moe_kernel(
     - expert_ids: A tensor containing the indices of the expert for each
         block. It determines which expert matrix from B should be used for
         each block in A.
+    - per_column: If True, use per-column quantization for B.
+    
     This kernel performs the multiplication of a token by its corresponding
     expert matrix as determined by `expert_ids`. The sorting of
     `sorted_token_ids` by expert index and padding ensures divisibility by
@@ -169,7 +175,18 @@ def fused_moe_kernel(
         else:
             a_scale = tl.load(a_scale_ptr)
             b_scale = tl.load(b_scale_ptr + off_experts)
-
+            
+    if use_int8_w8a8:
+        if per_column:
+            # 加载权重的per-column scale
+            b_scale_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
+            )
+            b_scale = tl.load(b_scale_ptrs)
+            # 加载激活值的per-token scale
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)
+            
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
@@ -210,6 +227,8 @@ def fused_moe_kernel(
                 accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
             else:
                 accumulator = tl.dot(a, b, acc=accumulator)
+        elif use_int8_w8a8:
+            accumulator += tl.dot(a, b)
         else:
             accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
@@ -226,6 +245,8 @@ def fused_moe_kernel(
             accumulator = accumulator.to(compute_type)
         else:
             accumulator = (accumulator * a_scale * b_scale).to(compute_type)
+    elif use_int8_w8a8:
+        accumulator = (accumulator * a_scale[:, None] * b_scale).to(compute_type)
     else:
         accumulator = accumulator.to(compute_type)
     # -----------------------------------------------------------
@@ -478,7 +499,9 @@ def invoke_fused_moe_kernel(
     compute_type: tl.dtype,
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int8_w8a8: bool,
     block_shape: Optional[List[int]] = None,
+    per_column: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -501,6 +524,8 @@ def invoke_fused_moe_kernel(
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
     elif use_int8_w8a16:
         assert B_scale is not None
+    elif use_int8_w8a8:
+        A, A_scale = per_token_quant_int8(A)
     else:
         assert A_scale is None
         assert B_scale is None
@@ -515,7 +540,6 @@ def invoke_fused_moe_kernel(
         even_Ks = True
     else:
         even_Ks = False
-
     fused_moe_kernel[grid](
         A,
         B,
@@ -549,9 +573,12 @@ def invoke_fused_moe_kernel(
         compute_type=compute_type,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
+        use_int8_w8a8=use_int8_w8a8,
         even_Ks=even_Ks,
+        per_column=per_column,
         **config,
     )
+
 
 
 def get_config_file_name(
@@ -722,11 +749,13 @@ def inplace_fused_experts(
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int8_w8a8: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    per_column: bool = False,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -738,11 +767,13 @@ def inplace_fused_experts(
         activation,
         use_fp8_w8a8,
         use_int8_w8a16,
+        use_int8_w8a8,
         w1_scale,
         w2_scale,
         a1_scale,
         a2_scale,
         block_shape,
+        per_column,
     )
 
 
@@ -755,6 +786,7 @@ def inplace_fused_experts_fake(
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int8_w8a8: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
@@ -781,11 +813,13 @@ def outplace_fused_experts(
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int8_w8a8: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    per_column: bool = False,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -797,11 +831,13 @@ def outplace_fused_experts(
         activation,
         use_fp8_w8a8,
         use_int8_w8a16,
+        use_int8_w8a8,
         w1_scale,
         w2_scale,
         a1_scale,
         a2_scale,
         block_shape,
+        per_column,
     )
 
 
@@ -841,11 +877,13 @@ def fused_experts(
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int8_w8a8: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    per_column: bool = False,
 ):
     if inplace:
         torch.ops.sglang.inplace_fused_experts(
@@ -857,11 +895,13 @@ def fused_experts(
             activation,
             use_fp8_w8a8,
             use_int8_w8a16,
+            use_int8_w8a8,
             w1_scale,
             w2_scale,
             a1_scale,
             a2_scale,
             block_shape,
+            per_column,
         )
         return hidden_states
     else:
@@ -874,11 +914,13 @@ def fused_experts(
             activation,
             use_fp8_w8a8,
             use_int8_w8a16,
+            use_int8_w8a8,
             w1_scale,
             w2_scale,
             a1_scale,
             a2_scale,
             block_shape,
+            per_column,
         )
 
 
@@ -892,11 +934,13 @@ def fused_experts_impl(
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int8_w8a8: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    per_column: bool = False,
 ):
     padded_size = padding_size
     if not use_fp8_w8a8 or block_shape is not None:
@@ -1001,9 +1045,10 @@ def fused_experts_impl(
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
+            use_int8_w8a8=use_int8_w8a8,
             block_shape=block_shape,
+            per_column=per_column,
         )
-
         if activation == "silu":
             if _is_cuda:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
@@ -1016,7 +1061,6 @@ def fused_experts_impl(
                 ops.gelu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
-
         invoke_fused_moe_kernel(
             intermediate_cache2,
             w2,
@@ -1034,7 +1078,9 @@ def fused_experts_impl(
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
+            use_int8_w8a8=use_int8_w8a8,
             block_shape=block_shape,
+            per_column=per_column,
         )
 
         if is_hip_flag:
@@ -1078,11 +1124,13 @@ def fused_moe(
     custom_routing_function: Optional[Callable] = None,
     use_fp8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int8_w8a8: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    per_column: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -1144,9 +1192,11 @@ def fused_moe(
         activation=activation,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
+        use_int8_w8a8=use_int8_w8a8,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
+        per_column=per_column,
     )
