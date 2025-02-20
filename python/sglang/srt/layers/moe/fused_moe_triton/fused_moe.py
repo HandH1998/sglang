@@ -82,10 +82,9 @@ def fused_moe_kernel(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
-    use_int8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    use_int8_w8a8: tl.constexpr,
     even_Ks: tl.constexpr,
-    per_column: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -107,7 +106,6 @@ def fused_moe_kernel(
     - expert_ids: A tensor containing the indices of the expert for each
         block. It determines which expert matrix from B should be used for
         each block in A.
-    - per_column: If True, use per-column quantization for B.
 
     This kernel performs the multiplication of a token by its corresponding
     expert matrix as determined by `expert_ids`. The sorting of
@@ -171,15 +169,14 @@ def fused_moe_kernel(
             b_scale = tl.load(b_scale_ptr + off_experts)
 
     if use_int8_w8a8:
-        if per_column:
-            # 加载权重的per-column scale
-            b_scale_ptrs = (
-                b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
-            )
-            b_scale = tl.load(b_scale_ptrs)
-            # 加载激活值的per-token scale
-            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
-            a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)
+        # Load per-column scale for weights
+        b_scale_ptrs = (
+            b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
+        )
+        b_scale = tl.load(b_scale_ptrs)
+        # Load per-token scale for activations
+        a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+        a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -221,8 +218,6 @@ def fused_moe_kernel(
                 accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
             else:
                 accumulator = tl.dot(a, b, acc=accumulator)
-        elif use_int8_w8a8:
-            accumulator += tl.dot(a, b)
         else:
             accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
@@ -495,7 +490,6 @@ def invoke_fused_moe_kernel(
     use_int8_w8a16: bool,
     use_int8_w8a8: bool,
     block_shape: Optional[List[int]] = None,
-    per_column: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -566,7 +560,6 @@ def invoke_fused_moe_kernel(
         use_int8_w8a16=use_int8_w8a16,
         use_int8_w8a8=use_int8_w8a8,
         even_Ks=even_Ks,
-        per_column=per_column,
         **config,
     )
 
@@ -745,7 +738,6 @@ def inplace_fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
-    per_column: bool = False,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -763,7 +755,6 @@ def inplace_fused_experts(
         a1_scale,
         a2_scale,
         block_shape,
-        per_column,
     )
 
 
@@ -809,7 +800,6 @@ def outplace_fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
-    per_column: bool = False,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -827,7 +817,6 @@ def outplace_fused_experts(
         a1_scale,
         a2_scale,
         block_shape,
-        per_column,
     )
 
 
@@ -873,7 +862,6 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
-    per_column: bool = False,
 ):
     if inplace:
         torch.ops.sglang.inplace_fused_experts(
@@ -891,7 +879,6 @@ def fused_experts(
             a1_scale,
             a2_scale,
             block_shape,
-            per_column,
         )
         return hidden_states
     else:
@@ -910,7 +897,6 @@ def fused_experts(
             a1_scale,
             a2_scale,
             block_shape,
-            per_column,
         )
 
 
@@ -930,7 +916,6 @@ def fused_experts_impl(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
-    per_column: bool = False,
 ):
     padded_size = padding_size
     if not use_fp8_w8a8 or block_shape is not None:
@@ -1017,7 +1002,6 @@ def fused_experts_impl(
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             curr_topk_ids, config["BLOCK_SIZE_M"], E
         )
-
         invoke_fused_moe_kernel(
             curr_hidden_states,
             w1,
@@ -1037,7 +1021,6 @@ def fused_experts_impl(
             use_int8_w8a16=use_int8_w8a16,
             use_int8_w8a8=use_int8_w8a8,
             block_shape=block_shape,
-            per_column=per_column,
         )
         if activation == "silu":
             ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
@@ -1064,7 +1047,6 @@ def fused_experts_impl(
             use_int8_w8a16=use_int8_w8a16,
             use_int8_w8a8=use_int8_w8a8,
             block_shape=block_shape,
-            per_column=per_column,
         )
 
         if is_hip_flag:
@@ -1114,7 +1096,6 @@ def fused_moe(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
-    per_column: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -1182,5 +1163,4 @@ def fused_moe(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
-        per_column=per_column,
     )
