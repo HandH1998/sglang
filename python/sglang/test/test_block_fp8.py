@@ -249,7 +249,7 @@ class TestW8A8BlockFP8FusedMoE(unittest.TestCase):
     E = [8, 24]
     TOP_KS = [2, 6]
     BLOCK_SIZE = [[64, 64], [64, 128], [128, 64], [128, 128]]
-    # BLOCK_SIZE = [[128, 128]]
+    BLOCK_SIZE = [[128, 128]]
     SEEDS = [0]
 
     @classmethod
