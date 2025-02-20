@@ -5,15 +5,11 @@ import torch
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-from sglang.srt.layers.quantization.fp8_kernel import (
-    per_token_group_quant_fp8,
-    w8a8_block_fp8_matmul,
-)
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 
 
 def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):
-    """Modified matrix multiplication function that supports per-token input quantization and per-column weight quantization"""
+    """Matrix multiplication function that supports per-token input quantization and per-column weight quantization"""
     A = A.to(torch.float32)
     B = B.to(torch.float32)
 
@@ -35,7 +31,7 @@ def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):
 
 
 def torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk):
-    """This function performs fused moe with per-column quantization using native torch."""
+    """This function performs fused moe with per-column int8 quantization using native torch."""
 
     B, D = a.shape
     # Perform per-token quantization
@@ -124,12 +120,12 @@ class TestW8A8Int8FusedMoE(unittest.TestCase):
                 score,
                 topk,
                 renormalize=False,
-                use_fp8_w8a8=False,  # Disable fp8
-                use_int8_w8a16=False,  # Enable int8
-                use_int8_w8a8=True,  # Enable int8
+                use_fp8_w8a8=False,  # Not using fp8
+                use_int8_w8a16=False,  # Not using int8-w8a16
+                use_int8_w8a8=True,  # Using int8-w8a8
                 w1_scale=w1_s,
                 w2_scale=w2_s,
-                block_shape=None,  # Don't use block quantization
+                block_shape=None,  # Not using block quantization
             )
 
         # Check results
