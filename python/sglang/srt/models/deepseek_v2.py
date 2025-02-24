@@ -837,18 +837,24 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.model = DeepseekV2Model(config, quant_config)
-        if global_server_args_dict["enable_dp_attention"]:
-            self.lm_head = ReplicatedLinear(
-                config.hidden_size,
-                config.vocab_size,
-                bias=False,
-            )
-            self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
-        else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config
-            )
-            self.logits_processor = LogitsProcessor(config)
+        # if global_server_args_dict["enable_dp_attention"]:
+        #     self.lm_head = ReplicatedLinear(
+        #         config.hidden_size,
+        #         config.vocab_size,
+        #         bias=False,
+        #     )
+        #     self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
+        # else:
+        #     self.lm_head = ParallelLMHead(
+        #         config.vocab_size, config.hidden_size, quant_config=quant_config
+        #     )
+        #     self.logits_processor = LogitsProcessor(config)
+        self.lm_head = ReplicatedLinear(
+                    config.hidden_size,
+                    config.vocab_size,
+                    bias=False,
+        )
+        self.logits_processor = LogitsProcessor(config, skip_all_gather=True)        
 
     @torch.no_grad()
     def forward(
